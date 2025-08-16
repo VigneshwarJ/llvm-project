@@ -1168,6 +1168,11 @@ void SCCPInstVisitor::visitInstruction(Instruction &I) {
 bool SCCPInstVisitor::mergeInValue(ValueLatticeElement &IV, Value *V,
                                    ValueLatticeElement MergeWithV,
                                    ValueLatticeElement::MergeOptions Opts) {
+  if (const auto *Arg = dyn_cast<Argument>(V)) {
+    if (isa<PointerType>(Arg->getType()) &&
+        Arg->hasNoAliasAttr())
+      return false;  // do not merge w/ noalias ptr.
+  }
   if (IV.mergeIn(MergeWithV, Opts)) {
     pushUsersToWorkList(V);
     LLVM_DEBUG(dbgs() << "Merged " << MergeWithV << " into " << *V << " : "
