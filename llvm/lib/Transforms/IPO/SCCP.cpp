@@ -176,7 +176,6 @@ static bool runIPSCCP(
       bool ReplacedPointerArg = false;
       for (Argument &Arg : F.args()) {
         if (!Arg.use_empty() && 
-            !Arg.hasNoAliasAttr() && //don't replace if arg is noalias
             Solver.tryToReplaceWithConstant(&Arg)) {
           ReplacedPointerArg |= Arg.getType()->isPointerTy();
           ++NumArgsElimed;
