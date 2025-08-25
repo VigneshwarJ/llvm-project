@@ -1122,6 +1122,8 @@ public:
     return HasPackedFP32Ops;
   }
 
+  bool enablesPackedFP32Ops() const;
+
   // Has V_PK_MOV_B32 opcode
   bool hasPkMovB32() const {
     return GFX90AInsts;

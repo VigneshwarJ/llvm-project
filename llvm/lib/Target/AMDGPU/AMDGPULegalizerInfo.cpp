@@ -952,7 +952,7 @@ AMDGPULegalizerInfo::AMDGPULegalizerInfo(const GCNSubtarget &ST_,
     FDIVActions.customFor({S16});
   }
 
-  if (ST.hasPackedFP32Ops()) {
+  if (ST.enablesPackedFP32Ops()) {
     FPOpActions.legalFor({V2S32});
     FPOpActions.clampMaxNumElementsStrict(0, S32, 2);
   }
