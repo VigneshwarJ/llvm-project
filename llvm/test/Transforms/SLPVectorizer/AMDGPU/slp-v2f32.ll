@@ -1,10 +1,12 @@
-; RUN: opt -S -mtriple=amdgcn-amd-amdhsa -mcpu=gfx908 -passes=slp-vectorizer < %s | FileCheck -check-prefixes=GCN,GFX908 %s
-; RUN: opt -S -mtriple=amdgcn-amd-amdhsa -mcpu=gfx90a -passes=slp-vectorizer < %s | FileCheck -check-prefixes=GCN,GFX90A %s
+; RUN: opt -S -mtriple=amdgcn-amd-amdhsa -mcpu=gfx908 -passes=slp-vectorizer < %s | FileCheck -check-prefixes=GCN,UNPACK %s
+; RUN: opt -S -mtriple=amdgcn-amd-amdhsa -mcpu=gfx90a -passes=slp-vectorizer < %s | FileCheck -check-prefixes=GCN,PACK %s
+; RUN: opt -S -mtriple=amdgcn-amd-amdhsa -mcpu=gfx950 -passes=slp-vectorizer < %s | FileCheck -check-prefixes=GCN,PACK %s
+; RUN: opt -S -mtriple=amdgcn-amd-amdhsa -mcpu=gfx950 --amdgpu-disable-packed-fp32=1 -passes=slp-vectorizer < %s | FileCheck -check-prefixes=GCN,UNPACK %s
 
 ; GCN-LABEL: @fadd_combine
-; GFX908: fadd float
-; GFX908: fadd float
-; GFX90A: fadd <2 x float>
+; UNPACK: fadd float
+; UNPACK: fadd float
+; PACK: fadd <2 x float>
 define amdgpu_kernel void @fadd_combine(ptr addrspace(1) %arg) {
 bb:
   %tmp = tail call i32 @llvm.amdgcn.workitem.id.x()
@@ -22,9 +24,9 @@ bb:
 }
 
 ; GCN-LABEL: @fmul_combine
-; GFX908: fmul float
-; GFX908: fmul float
-; GFX90A: fmul <2 x float>
+; UNPACK: fmul float
+; UNPACK: fmul float
+; PACK: fmul <2 x float>
 define amdgpu_kernel void @fmul_combine(ptr addrspace(1) %arg) {
 bb:
   %tmp = tail call i32 @llvm.amdgcn.workitem.id.x()
@@ -42,9 +44,9 @@ bb:
 }
 
 ; GCN-LABEL: @fma_combine
-; GFX908: call float @llvm.fma.f32
-; GFX908: call float @llvm.fma.f32
-; GFX90A: call <2 x float> @llvm.fma.v2f32
+; UNPACK: call float @llvm.fma.f32
+; UNPACK: call float @llvm.fma.f32
+; PACK: call <2 x float> @llvm.fma.v2f32
 define amdgpu_kernel void @fma_combine(ptr addrspace(1) %arg) {
 bb:
   %tmp = tail call i32 @llvm.amdgcn.workitem.id.x()
@@ -63,4 +65,3 @@ bb:
 
 declare i32 @llvm.amdgcn.workitem.id.x()
 declare float @llvm.fma.f32(float, float, float)
-

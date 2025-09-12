@@ -52,6 +52,12 @@ static cl::opt<unsigned>
                  cl::desc("Number of addresses from which to enable MIMG NSA."),
                  cl::init(2), cl::Hidden);
 
+static cl::opt<bool>
+    DisablePackedFP32("amdgpu-disable-packed-fp32",
+                      cl::desc("Whether or not to used packed FP 32 ops on "
+                               "architectures which support it"),
+                      cl::ReallyHidden, cl::init(false));
+
 GCNSubtarget::~GCNSubtarget() = default;
 
 GCNSubtarget &GCNSubtarget::initializeSubtargetDependencies(const Triple &TT,
@@ -763,4 +769,8 @@ void GCNUserSGPRUsageInfo::allocKernargPreloadSGPRs(unsigned NumSGPRs) {
 
 unsigned GCNUserSGPRUsageInfo::getNumFreeUserSGPRs() {
   return AMDGPU::getMaxNumUserSGPRs(ST) - NumUsedUserSGPRs;
+}
+
+bool GCNSubtarget::enablesPackedFP32Ops() const {
+  return HasPackedFP32Ops && !DisablePackedFP32;
 }
