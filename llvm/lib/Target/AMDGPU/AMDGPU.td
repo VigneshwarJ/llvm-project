@@ -2586,7 +2586,7 @@ def HasDPP8 : Predicate<"Subtarget->hasDPP8()">,
 def HasDPALU_DPP : Predicate<"Subtarget->hasDPALU_DPP()">,
   AssemblerPredicate<(all_of FeatureDPALU_DPP)>;
 
-def HasPackedFP32Ops : Predicate<"Subtarget->hasPackedFP32Ops()">,
+def EnablesPackedFP32Ops : Predicate<"Subtarget->enablesPackedFP32Ops()">,
   AssemblerPredicate<(all_of FeaturePackedFP32Ops)>;
 
 def HasPkMovB32 : Predicate<"Subtarget->hasPkMovB32()">,
