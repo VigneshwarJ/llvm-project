@@ -1157,7 +1157,7 @@ void GCNScheduleDAGMILive::runSchedStages() {
             ->reset(MRI, RegionLiveOuts.getLiveRegsForRegionIdx(
                              Stage->getRegionIdx()));
       }
-
+      LIS->reanalyze(MF);
       ScheduleDAGMILive::schedule();
       Stage->finalizeGCNRegion();
     }
