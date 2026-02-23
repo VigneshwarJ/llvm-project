@@ -342,13 +342,6 @@ KnownFPClass KnownFPClass::fmul(const KnownFPClass &KnownLHS,
   if (!KnownLHS.isKnownNeverNaN() || !KnownRHS.isKnownNeverNaN())
     return Known;
 
-  if (KnownLHS.SignBit && KnownRHS.SignBit) {
-    if (*KnownLHS.SignBit == *KnownRHS.SignBit)
-      Known.signBitMustBeZero();
-    else
-      Known.signBitMustBeOne();
-  }
-
   // If 0 * +/-inf produces NaN.
   if ((KnownRHS.isKnownNeverInfinity() ||
        KnownLHS.isKnownNeverLogicalZero(Mode)) &&
@@ -671,6 +664,43 @@ KnownFPClass KnownFPClass::ldexp(const KnownFPClass &KnownSrc,
     if (KnownSrc.isKnownNeverLogicalNegZero(Mode))
       Known.knownNot(fcNegZero);
   }
+
+  return Known;
+}
+
+// TODO: Detect no-infinity cases
+KnownFPClass KnownFPClass::powi(const KnownFPClass &KnownSrc,
+                                const KnownBits &ExponentKnownBits) {
+  KnownFPClass Known;
+  Known.propagateNaN(KnownSrc);
+
+  if (ExponentKnownBits.isZero()) {
+    // powi(QNaN, 0) returns 1.0, and powi(SNaN, 0) may non-deterministically
+    // return 1.0 or a NaN.
+    if (KnownSrc.isKnownNever(fcSNan)) {
+      Known.knownNot(~fcPosNormal);
+      return Known;
+    }
+
+    Known.knownNot(~(fcPosNormal | fcNan));
+    return Known;
+  }
+
+  if (ExponentKnownBits.isEven()) {
+    Known.knownNot(fcNegative);
+    return Known;
+  }
+
+  // Given that exp is an integer, here are the
+  // ways that pow can return a negative value:
+  //
+  //   pow(-x, exp)   --> negative if exp is odd and x is negative.
+  //   pow(-0, exp)   --> -inf if exp is negative odd.
+  //   pow(-0, exp)   --> -0 if exp is positive odd.
+  //   pow(-inf, exp) --> -0 if exp is negative odd.
+  //   pow(-inf, exp) --> -inf if exp is positive odd.
+  if (KnownSrc.isKnownNever(fcNegative))
+    Known.knownNot(fcNegative);
 
   return Known;
 }
