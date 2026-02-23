@@ -2,8 +2,8 @@
 ; RUN: llc -mtriple=amdgcn -mcpu=gfx900 < %s | FileCheck %s --check-prefix=GFX9
 ; RUN: llc -mtriple=amdgcn -mcpu=gfx1200 -mattr=+real-true16 < %s | FileCheck %s --check-prefix=GFX12-TRUE16
 
-; Test that the DAG combine in performAndCombine recognizes
-; (and (lshr x, C), mask) for i8/i16 and lowers it to v_bfe_u32.
+; Test that isel patterns recognize (and (lshr x, C), mask) for i8/i16
+; and lower it to v_bfe_u32 when real true16 instructions are not used.
 
 define i16 @bfe_i16(i16 %a) {
 ; GFX9-LABEL: bfe_i16:
@@ -52,33 +52,118 @@ define i8 @bfe_i8(i8 %a) {
   ret i8 %and
 }
 
-; Negative: <2 x i1> element extractions should combine into a single AND
-; mask (v_and 3), not produce individual BFE instructions.
-define void @no_bfe_v2i1(ptr addrspace(1) %in, ptr addrspace(1) %out) {
-; GFX9-LABEL: no_bfe_v2i1:
+; Negative: multiple uses of the shifted value should not match the one-use
+; narrow BFE pattern.
+define i16 @no_bfe_i16_multi_use(i16 %a) {
+; GFX9-LABEL: no_bfe_i16_multi_use:
 ; GFX9:       ; %bb.0:
 ; GFX9-NEXT:    s_waitcnt vmcnt(0) expcnt(0) lgkmcnt(0)
-; GFX9-NEXT:    global_load_ubyte v0, v[0:1], off
-; GFX9-NEXT:    s_waitcnt vmcnt(0)
+; GFX9-NEXT:    v_lshrrev_b16_e32 v0, 4, v0
+; GFX9-NEXT:    v_and_b32_e32 v1, 15, v0
 ; GFX9-NEXT:    v_and_b32_e32 v0, 3, v0
-; GFX9-NEXT:    global_store_byte v[2:3], v0, off
-; GFX9-NEXT:    s_waitcnt vmcnt(0)
+; GFX9-NEXT:    v_xor_b32_e32 v0, v1, v0
 ; GFX9-NEXT:    s_setpc_b64 s[30:31]
 ;
-; GFX12-TRUE16-LABEL: no_bfe_v2i1:
+; GFX12-TRUE16-LABEL: no_bfe_i16_multi_use:
 ; GFX12-TRUE16:       ; %bb.0:
 ; GFX12-TRUE16-NEXT:    s_wait_loadcnt_dscnt 0x0
 ; GFX12-TRUE16-NEXT:    s_wait_expcnt 0x0
 ; GFX12-TRUE16-NEXT:    s_wait_samplecnt 0x0
 ; GFX12-TRUE16-NEXT:    s_wait_bvhcnt 0x0
 ; GFX12-TRUE16-NEXT:    s_wait_kmcnt 0x0
-; GFX12-TRUE16-NEXT:    global_load_d16_u8 v0, v[0:1], off
-; GFX12-TRUE16-NEXT:    s_wait_loadcnt 0x0
+; GFX12-TRUE16-NEXT:    v_lshrrev_b16 v0.l, 4, v0.l
+; GFX12-TRUE16-NEXT:    s_delay_alu instid0(VALU_DEP_1) | instskip(SKIP_1) | instid1(VALU_DEP_1)
+; GFX12-TRUE16-NEXT:    v_and_b16 v0.h, v0.l, 15
 ; GFX12-TRUE16-NEXT:    v_and_b16 v0.l, v0.l, 3
-; GFX12-TRUE16-NEXT:    global_store_b8 v[2:3], v0, off
+; GFX12-TRUE16-NEXT:    v_xor_b16 v0.l, v0.h, v0.l
 ; GFX12-TRUE16-NEXT:    s_setpc_b64 s[30:31]
-  %a = load <2 x i1>, ptr addrspace(1) %in
-  %freeze = freeze <2 x i1> %a
-  store <2 x i1> %freeze, ptr addrspace(1) %out
+  %shr = lshr i16 %a, 4
+  %and0 = and i16 %shr, 15
+  %and1 = and i16 %shr, 3
+  %xor = xor i16 %and0, %and1
+  ret i16 %xor
+}
+
+; Pure uniform (SGPR) case.
+define amdgpu_kernel void @bfe_i16_uniform(i16 %a, ptr addrspace(1) %out) {
+; GFX9-LABEL: bfe_i16_uniform:
+; GFX9:       ; %bb.0:
+; GFX9-NEXT:    s_load_dword s2, s[4:5], 0x24
+; GFX9-NEXT:    s_load_dwordx2 s[0:1], s[4:5], 0x2c
+; GFX9-NEXT:    v_mov_b32_e32 v0, 0
+; GFX9-NEXT:    s_waitcnt lgkmcnt(0)
+; GFX9-NEXT:    s_bfe_u32 s2, s2, 0x40004
+; GFX9-NEXT:    v_mov_b32_e32 v1, s2
+; GFX9-NEXT:    global_store_short v0, v1, s[0:1]
+; GFX9-NEXT:    s_endpgm
+;
+; GFX12-TRUE16-LABEL: bfe_i16_uniform:
+; GFX12-TRUE16:       ; %bb.0:
+; GFX12-TRUE16-NEXT:    s_clause 0x1
+; GFX12-TRUE16-NEXT:    s_load_b32 s2, s[4:5], 0x24
+; GFX12-TRUE16-NEXT:    s_load_b64 s[0:1], s[4:5], 0x2c
+; GFX12-TRUE16-NEXT:    s_wait_kmcnt 0x0
+; GFX12-TRUE16-NEXT:    s_bfe_u32 s2, s2, 0x40004
+; GFX12-TRUE16-NEXT:    s_delay_alu instid0(SALU_CYCLE_1)
+; GFX12-TRUE16-NEXT:    v_dual_mov_b32 v0, 0 :: v_dual_mov_b32 v1, s2
+; GFX12-TRUE16-NEXT:    global_store_b16 v0, v1, s[0:1]
+; GFX12-TRUE16-NEXT:    s_endpgm
+  %shr = lshr i16 %a, 4
+  %and = and i16 %shr, 15
+  store i16 %and, ptr addrspace(1) %out
   ret void
+}
+
+define amdgpu_kernel void @bfe_i8_uniform(i8 %a, ptr addrspace(1) %out) {
+; GFX9-LABEL: bfe_i8_uniform:
+; GFX9:       ; %bb.0:
+; GFX9-NEXT:    s_load_dword s2, s[4:5], 0x24
+; GFX9-NEXT:    s_load_dwordx2 s[0:1], s[4:5], 0x2c
+; GFX9-NEXT:    v_mov_b32_e32 v0, 0
+; GFX9-NEXT:    s_waitcnt lgkmcnt(0)
+; GFX9-NEXT:    s_bfe_u32 s2, s2, 0x40004
+; GFX9-NEXT:    v_mov_b32_e32 v1, s2
+; GFX9-NEXT:    global_store_byte v0, v1, s[0:1]
+; GFX9-NEXT:    s_endpgm
+;
+; GFX12-TRUE16-LABEL: bfe_i8_uniform:
+; GFX12-TRUE16:       ; %bb.0:
+; GFX12-TRUE16-NEXT:    s_clause 0x1
+; GFX12-TRUE16-NEXT:    s_load_b32 s2, s[4:5], 0x24
+; GFX12-TRUE16-NEXT:    s_load_b64 s[0:1], s[4:5], 0x2c
+; GFX12-TRUE16-NEXT:    s_wait_kmcnt 0x0
+; GFX12-TRUE16-NEXT:    s_bfe_u32 s2, s2, 0x40004
+; GFX12-TRUE16-NEXT:    s_delay_alu instid0(SALU_CYCLE_1)
+; GFX12-TRUE16-NEXT:    v_dual_mov_b32 v0, 0 :: v_dual_mov_b32 v1, s2
+; GFX12-TRUE16-NEXT:    global_store_b8 v0, v1, s[0:1]
+; GFX12-TRUE16-NEXT:    s_endpgm
+  %shr = lshr i8 %a, 4
+  %and = and i8 %shr, 15
+  store i8 %and, ptr addrspace(1) %out
+  ret void
+}
+
+; Vector case: keep the packed shift/and lowering.
+define <2 x i16> @bfe_v2i16(<2 x i16> %a) {
+; GFX9-LABEL: bfe_v2i16:
+; GFX9:       ; %bb.0:
+; GFX9-NEXT:    s_waitcnt vmcnt(0) expcnt(0) lgkmcnt(0)
+; GFX9-NEXT:    v_pk_lshrrev_b16 v0, 4, v0 op_sel_hi:[0,1]
+; GFX9-NEXT:    v_and_b32_e32 v0, 0xf000f, v0
+; GFX9-NEXT:    s_setpc_b64 s[30:31]
+;
+; GFX12-TRUE16-LABEL: bfe_v2i16:
+; GFX12-TRUE16:       ; %bb.0:
+; GFX12-TRUE16-NEXT:    s_wait_loadcnt_dscnt 0x0
+; GFX12-TRUE16-NEXT:    s_wait_expcnt 0x0
+; GFX12-TRUE16-NEXT:    s_wait_samplecnt 0x0
+; GFX12-TRUE16-NEXT:    s_wait_bvhcnt 0x0
+; GFX12-TRUE16-NEXT:    s_wait_kmcnt 0x0
+; GFX12-TRUE16-NEXT:    v_pk_lshrrev_b16 v0, 4, v0 op_sel_hi:[0,1]
+; GFX12-TRUE16-NEXT:    s_delay_alu instid0(VALU_DEP_1)
+; GFX12-TRUE16-NEXT:    v_and_b32_e32 v0, 0xf000f, v0
+; GFX12-TRUE16-NEXT:    s_setpc_b64 s[30:31]
+  %shr = lshr <2 x i16> %a, <i16 4, i16 4>
+  %and = and <2 x i16> %shr, <i16 15, i16 15>
+  ret <2 x i16> %and
 }
