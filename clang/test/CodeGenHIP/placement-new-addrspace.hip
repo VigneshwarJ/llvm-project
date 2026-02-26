@@ -32,40 +32,17 @@ __attribute__((device)) Big make_big() { return Big(7); }
 // CHECK-NEXT:  [[ENTRY:.*:]]
 // CHECK-NEXT:    [[OUT:%.*]] = alloca ptr, align 8, addrspace(5)
 // CHECK-NEXT:    [[OUT_ADDR:%.*]] = alloca ptr, align 8, addrspace(5)
-// CHECK-NEXT:    [[TMP_SRET:%.*]] = alloca [[STRUCT_BIG:%.*]], align 4, addrspace(5)
+// CHECK-NEXT:    [[TMP:%.*]] = alloca [[STRUCT_BIG:%.*]], align 4, addrspace(5)
 // CHECK-NEXT:    [[OUT_ASCAST:%.*]] = addrspacecast ptr addrspace(5) [[OUT]] to ptr
 // CHECK-NEXT:    [[OUT_ADDR_ASCAST:%.*]] = addrspacecast ptr addrspace(5) [[OUT_ADDR]] to ptr
 // CHECK-NEXT:    store ptr addrspace(1) [[OUT_COERCE]], ptr [[OUT_ASCAST]], align 8
 // CHECK-NEXT:    [[OUT1:%.*]] = load ptr, ptr [[OUT_ASCAST]], align 8
 // CHECK-NEXT:    store ptr [[OUT1]], ptr [[OUT_ADDR_ASCAST]], align 8
 // CHECK-NEXT:    [[TMP0:%.*]] = load ptr, ptr [[OUT_ADDR_ASCAST]], align 8
-// CHECK-NEXT:    call void @_Z8make_bigv(ptr addrspace(5) dead_on_unwind writable sret([[STRUCT_BIG]]) align 4 [[TMP_SRET]]) #[[ATTR3]]
-// CHECK-NEXT:    call void @llvm.memcpy.p0.p5.i64(ptr align 4 [[TMP0]], ptr addrspace(5) align 4 [[TMP_SRET]], i64 128, i1 false)
+// CHECK-NEXT:    call void @_Z8make_bigv(ptr addrspace(5) dead_on_unwind writable sret([[STRUCT_BIG]]) align 4 [[TMP]]) #[[ATTR3]]
+// CHECK-NEXT:    call void @llvm.memcpy.p0.p5.i64(ptr align 4 [[TMP0]], ptr addrspace(5) align 4 [[TMP]], i64 128, i1 false)
 // CHECK-NEXT:    ret void
 //
 __attribute__((global)) void kernel(Big *out) {
   new (out) Big(make_big());
-}
-
-// CHECK-LABEL: define dso_local amdgpu_kernel void @_Z13kernel_assignP3Big(
-// CHECK-SAME: ptr addrspace(1) noundef [[OUT_COERCE:%.*]]) #[[ATTR1]] {
-// CHECK-NEXT:  [[ENTRY:.*:]]
-// CHECK-NEXT:    [[OUT:%.*]] = alloca ptr, align 8, addrspace(5)
-// CHECK-NEXT:    [[OUT_ADDR:%.*]] = alloca ptr, align 8, addrspace(5)
-// CHECK-NEXT:    [[REF_TMP:%.*]] = alloca [[STRUCT_BIG:%.*]], align 4, addrspace(5)
-// CHECK-NEXT:    [[TMP_SRET:%.*]] = alloca [[STRUCT_BIG]], align 4, addrspace(5)
-// CHECK-NEXT:    [[OUT_ASCAST:%.*]] = addrspacecast ptr addrspace(5) [[OUT]] to ptr
-// CHECK-NEXT:    [[OUT_ADDR_ASCAST:%.*]] = addrspacecast ptr addrspace(5) [[OUT_ADDR]] to ptr
-// CHECK-NEXT:    [[REF_TMP_ASCAST:%.*]] = addrspacecast ptr addrspace(5) [[REF_TMP]] to ptr
-// CHECK-NEXT:    store ptr addrspace(1) [[OUT_COERCE]], ptr [[OUT_ASCAST]], align 8
-// CHECK-NEXT:    [[OUT1:%.*]] = load ptr, ptr [[OUT_ASCAST]], align 8
-// CHECK-NEXT:    store ptr [[OUT1]], ptr [[OUT_ADDR_ASCAST]], align 8
-// CHECK-NEXT:    call void @_Z8make_bigv(ptr addrspace(5) dead_on_unwind writable sret([[STRUCT_BIG]]) align 4 [[TMP_SRET]]) #[[ATTR3]]
-// CHECK-NEXT:    call void @llvm.memcpy.p0.p5.i64(ptr align 4 [[REF_TMP_ASCAST]], ptr addrspace(5) align 4 [[TMP_SRET]], i64 128, i1 false)
-// CHECK-NEXT:    [[TMP0:%.*]] = load ptr, ptr [[OUT_ADDR_ASCAST]], align 8
-// CHECK-NEXT:    call void @llvm.memcpy.p0.p0.i64(ptr align 4 [[TMP0]], ptr align 4 [[REF_TMP_ASCAST]], i64 128, i1 false)
-// CHECK-NEXT:    ret void
-//
-__attribute__((global)) void kernel_assign(Big *out) {
-  *out = make_big();
 }

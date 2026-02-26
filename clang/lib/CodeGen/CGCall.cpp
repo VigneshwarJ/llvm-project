@@ -5427,9 +5427,7 @@ RValue CodeGenFunction::EmitCall(const CGFunctionInfo &CallInfo,
   // If the call returns a temporary with struct return, create a temporary
   // alloca to hold the result, unless one is given to us.
   Address SRetPtr = Address::invalid();
-  Address OriginalSRetPtr = Address::invalid();
   bool NeedSRetLifetimeEnd = false;
-  bool NeedSRetCopyBack = false;
   if (RetAI.isIndirect() || RetAI.isInAlloca() || RetAI.isCoerceAndExpand()) {
     // For virtual function pointer thunks and musttail calls, we must always
     // forward an incoming SRet pointer to the callee, because a local alloca
@@ -5441,7 +5439,6 @@ RValue CodeGenFunction::EmitCall(const CGFunctionInfo &CallInfo,
                                              RetTy, CharUnits::fromQuantity(1));
     } else if (!ReturnValue.isNull()) {
       SRetPtr = ReturnValue.getAddress();
-      OriginalSRetPtr = SRetPtr;
     } else {
       SRetPtr = CreateMemTempWithoutCast(RetTy, "tmp");
       if (HaveInsertPoint() && ReturnValue.isUnused())
@@ -5453,26 +5450,12 @@ RValue CodeGenFunction::EmitCall(const CGFunctionInfo &CallInfo,
       // a chain involving stores to / loads from the DefaultAS; we address this
       // here, symmetrically with the handling we have for normal pointer args.
       if (SRetPtr.getAddressSpace() != RetAI.getIndirectAddrSpace()) {
-        // If the caller supplied a destination in a different address space,
-        // materialize the call result in a temporary with the callee's expected
-        // sret address space and copy back after the call.
-        if (OriginalSRetPtr.isValid() && !IsVirtualFunctionPointerThunk &&
-            !IsMustTail) {
-          Address TmpSRetPtr = CreateMemTempWithoutCast(RetTy, "tmp.sret");
-          if (TmpSRetPtr.getAddressSpace() == RetAI.getIndirectAddrSpace()) {
-            SRetPtr = TmpSRetPtr;
-            NeedSRetCopyBack = true;
-          }
-        }
+        llvm::Value *V = SRetPtr.getBasePointer();
+        llvm::Type *Ty = llvm::PointerType::get(getLLVMContext(),
+                                                RetAI.getIndirectAddrSpace());
 
-        if (!NeedSRetCopyBack) {
-          llvm::Value *V = SRetPtr.getBasePointer();
-          llvm::Type *Ty = llvm::PointerType::get(getLLVMContext(),
-                                                  RetAI.getIndirectAddrSpace());
-
-          SRetPtr = SRetPtr.withPointer(performAddrSpaceCast(V, Ty),
-                                        SRetPtr.isKnownNonNull());
-        }
+        SRetPtr = SRetPtr.withPointer(performAddrSpaceCast(V, Ty),
+                                      SRetPtr.isKnownNonNull());
       }
       IRCallArgs[IRFunctionArgs.getSRetArgNo()] =
           getAsNaturalPointerTo(SRetPtr, RetTy);
@@ -6287,13 +6270,6 @@ RValue CodeGenFunction::EmitCall(const CGFunctionInfo &CallInfo,
   // The stack cleanup for inalloca arguments has to run out of the normal
   // lexical order, so deactivate it and run it manually here.
   CallArgs.freeArgumentMemory(*this);
-
-  if (NeedSRetCopyBack) {
-    LValue DstLV = MakeAddrLValue(OriginalSRetPtr, RetTy);
-    LValue SrcLV = MakeAddrLValue(SRetPtr, RetTy);
-    EmitAggregateCopy(DstLV, SrcLV, RetTy, AggValueSlot::MayOverlap);
-    SRetPtr = OriginalSRetPtr;
-  }
 
   // Extract the return value.
   RValue Ret;

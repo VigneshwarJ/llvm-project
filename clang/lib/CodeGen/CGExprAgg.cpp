@@ -286,8 +286,14 @@ void AggExprEmitter::withReturnValueSlot(
   // We need to always provide our own temporary if destruction is required.
   // Otherwise, EmitCall will emit its own, notice that it's "unused", and end
   // its lifetime before we have the chance to emit a proper destructor call.
-  bool UseTemp = Dest.isPotentiallyAliased() || Dest.requiresGCollection() ||
-                 (RequiresDestruction && Dest.isIgnored());
+  //
+  // We also need a temporary if the destination is in a different address space
+  // from the alloca AS, to avoid an invalid addrspacecast on the sret pointer.
+  bool UseTemp =
+      Dest.isPotentiallyAliased() || Dest.requiresGCollection() ||
+      (RequiresDestruction && Dest.isIgnored()) ||
+      (!Dest.isIgnored() && Dest.getAddress().getAddressSpace() !=
+                                CGF.CGM.getDataLayout().getAllocaAddrSpace());
 
   Address RetAddr = Address::invalid();
 
