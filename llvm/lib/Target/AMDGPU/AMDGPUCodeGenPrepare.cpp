@@ -259,6 +259,7 @@ public:
 
   bool visitIntrinsicInst(IntrinsicInst &I);
   bool visitFMinLike(IntrinsicInst &I);
+  bool visitExp2(IntrinsicInst &I);
   bool visitSqrt(IntrinsicInst &I);
   bool visitLog(FPMathOperator &Log, Intrinsic::ID IID);
   bool visitMbcntLo(IntrinsicInst &I) const;
@@ -2031,6 +2032,8 @@ bool AMDGPUCodeGenPrepareImpl::visitIntrinsicInst(IntrinsicInst &I) {
   case Intrinsic::minimumnum:
   case Intrinsic::minimum:
     return visitFMinLike(I);
+  case Intrinsic::exp2:
+    return visitExp2(I);
   case Intrinsic::sqrt:
     return visitSqrt(I);
   case Intrinsic::log:
@@ -2132,6 +2135,93 @@ bool AMDGPUCodeGenPrepareImpl::visitFMinLike(IntrinsicInst &I) {
   I.replaceAllUsesWith(Fract);
   DeadVals.push_back(&I);
   return true;
+}
+
+// Replace llvm.exp2 with f32 element type plus an explicit denormal flush
+// with llvm.amdgcn.exp2.f32 (scalarized for vectors). v_exp_f32 never
+// produces subnormals, so the flush is a no-op and can be removed.
+//
+// Match pattern:
+//   %r = call float @llvm.exp2.f32(float %x)
+//   %bits = bitcast float %r to i32
+//   %expfield = and i32 %bits, 0x7f800000
+//   %isdenorm = icmp eq i32 %expfield, 0
+//   %flushed = select i1 %isdenorm, float 0.0, float %r
+//
+// Also handles <N x float> variants.
+bool AMDGPUCodeGenPrepareImpl::visitExp2(IntrinsicInst &Exp2) {
+  Type *Ty = Exp2.getType();
+  if (!Ty->getScalarType()->isFloatTy())
+    return false;
+
+  // Already in DAZ mode, no denorm handling needed.
+  if (HasFP32DenormalFlush)
+    return false;
+
+  Value *Src = Exp2.getOperand(0);
+
+  // Look for the denorm flush pattern on any user of the exp2 result.
+  for (User *U : Exp2.users()) {
+    auto *BC = dyn_cast<BitCastInst>(U);
+    if (!BC || !BC->getType()->isIntOrIntVectorTy(32))
+      continue;
+
+    for (User *BCU : BC->users()) {
+      Value *AndLHS;
+      const APInt *AndMask;
+      if (!match(BCU, m_And(m_Value(AndLHS), m_APInt(AndMask))))
+        continue;
+      if (*AndMask != APInt(32, 0x7f800000))
+        continue;
+
+      for (User *AndU : BCU->users()) {
+        auto *Cmp = dyn_cast<ICmpInst>(AndU);
+        if (!Cmp || Cmp->getPredicate() != ICmpInst::ICMP_EQ)
+          continue;
+        if (!match(Cmp->getOperand(1), m_Zero()))
+          continue;
+
+        for (User *CmpU : AndU->users()) {
+          Value *TrueVal, *FalseVal, *Cond;
+          if (!match(CmpU, m_Select(m_Value(Cond), m_Value(TrueVal),
+                                    m_Value(FalseVal))))
+            continue;
+          if (Cond != AndU)
+            continue;
+
+          if (!match(TrueVal, m_AnyZeroFP()) || FalseVal != &Exp2)
+            continue;
+
+          // Replace with scalarized llvm.amdgcn.exp2.f32 calls.
+          IRBuilder<> Builder(&Exp2);
+          Builder.setFastMathFlags(Exp2.getFastMathFlags());
+
+          SmallVector<Value *, 4> SrcVals;
+          extractValues(Builder, SrcVals, Src);
+
+          Function *AmdgcnExp2 = Intrinsic::getOrInsertDeclaration(
+              F.getParent(), Intrinsic::amdgcn_exp2,
+              {Type::getFloatTy(F.getContext())});
+
+          SmallVector<Value *, 4> ResultVals(SrcVals.size());
+          for (unsigned I = 0, E = SrcVals.size(); I != E; ++I)
+            ResultVals[I] = Builder.CreateCall(AmdgcnExp2, {SrcVals[I]});
+
+          Value *NewExp2 = insertValues(Builder, Ty, ResultVals);
+          NewExp2->takeName(&Exp2);
+
+          auto *SelectI = cast<Instruction>(CmpU);
+          SelectI->replaceAllUsesWith(NewExp2);
+          Exp2.replaceAllUsesWith(NewExp2);
+          DeadVals.push_back(SelectI);
+          DeadVals.push_back(&Exp2);
+          return true;
+        }
+      }
+    }
+  }
+
+  return false;
 }
 
 // Expand llvm.sqrt.f32 calls with !fpmath metadata in a semi-fast way.
