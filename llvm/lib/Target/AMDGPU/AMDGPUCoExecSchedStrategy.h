@@ -644,6 +644,10 @@ public:
                                 GenericSchedulerBase::SchedCandidate &Cand,
                                 SchedBoundary *Zone) const;
 
+  bool tryCriticalResourcePrio(GenericSchedulerBase::SchedCandidate &TryCand,
+                               GenericSchedulerBase::SchedCandidate &Cand,
+                               SchedBoundary *Zone) const;
+
   /// ShadowMix heuristic: prefer window-producing instructions (WMMA, TRANS,
   /// MultiCycleVALU) over compatible fillers so fillers execute in the
   /// producer's shadow. When fillers are insufficient, steer enablement

@@ -1678,6 +1678,20 @@ void CandidateHeuristics::sortHWUIResources(SchedBoundary *Zone,
   llvm::sort(HWUInfo, [UseExposed, UseDependencySort,
                        this](HardwareUnitInfo &A, HardwareUnitInfo &B) {
     // Prefer CoexecWindow producers
+    if (A.producesCoexecWindow() != B.producesCoexecWindow())
+      return A.producesCoexecWindow();
+
+    // Prefer flavors with non-zero exposed cycles, and within that group
+    // prefer more exposed first. Producers (handled above) are not part of
+    // this comparison.
+    if (UseExposed) {
+      bool AExp = A.getRemainingExposed() > 0;
+      bool BExp = B.getRemainingExposed() > 0;
+      if (AExp != BExp)
+        return AExp;
+      if (A.getRemainingExposed() != B.getRemainingExposed())
+        return A.getRemainingExposed() > B.getRemainingExposed();
+    }
 
     if (UseDependencySort) {
       unsigned AReadyCycles = MixInfo.getReadyCycles(A.getType());
@@ -1696,20 +1710,6 @@ void CandidateHeuristics::sortHWUIResources(SchedBoundary *Zone,
         return AUnreadyCycles > BUnreadyCycles;
     }
 
-    if (A.producesCoexecWindow() != B.producesCoexecWindow())
-      return A.producesCoexecWindow();
-
-    // Prefer flavors with non-zero exposed cycles, and within that group
-    // prefer more exposed first. Producers (handled above) are not part of
-    // this comparison.
-    if (UseExposed) {
-      bool AExp = A.getRemainingExposed() > 0;
-      bool BExp = B.getRemainingExposed() > 0;
-      if (AExp != BExp)
-        return AExp;
-      if (A.getRemainingExposed() != B.getRemainingExposed())
-        return A.getRemainingExposed() > B.getRemainingExposed();
-    }
 
     // Prefer more demanded resources
     if (A.getTotalCycles() != B.getTotalCycles())
@@ -2075,6 +2075,35 @@ bool CandidateHeuristics::tryCoexecSlot(
   return false;
 }
 
+bool CandidateHeuristics::tryCriticalResourcePrio(
+    GenericSchedulerBase::SchedCandidate &TryCand,
+    GenericSchedulerBase::SchedCandidate &Cand, SchedBoundary *Zone) const {
+
+  for (unsigned I = 0; I < HWUInfo.size(); I++) {
+    const HardwareUnitInfo &HWUI = HWUInfo[I];
+
+    bool CandUsesCrit = HWUI.contains(Cand.SU);
+    bool TryCandUsesCrit = HWUI.contains(TryCand.SU);
+
+    if (CandUsesCrit != TryCandUsesCrit)
+      return false;
+
+    // Prioritize based on HWUI priorities.
+    SUnit *Match = HWUI.getHigherPriority(Cand.SU, TryCand.SU);
+    if (Match) {
+      if (Match == Cand.SU) {
+        if (Cand.Reason > GenericSchedulerBase::RegCritical)
+          Cand.Reason = GenericSchedulerBase::RegCritical;
+        return true;
+      }
+      TryCand.Reason = GenericSchedulerBase::RegCritical;
+      return true;
+    }
+  }
+
+  return false;
+}
+
 bool CandidateHeuristics::tryCriticalResourceDependency(
     GenericSchedulerBase::SchedCandidate &TryCand,
     GenericSchedulerBase::SchedCandidate &Cand, SchedBoundary *Zone) const {
@@ -2125,27 +2154,7 @@ bool CandidateHeuristics::tryCriticalResourceDependency(
       return true;
     }
 
-    // Both enable, prefer the critical path.
-    unsigned CandHeight = Cand.SU->getHeight();
-    unsigned TryCandHeight = TryCand.SU->getHeight();
-
-    if (CandHeight > TryCandHeight) {
-      if (Cand.Reason > GenericSchedulerBase::RegCritical)
-        Cand.Reason = GenericSchedulerBase::RegCritical;
-
-      return true;
-    }
-
-    if (CandHeight < TryCandHeight) {
-      TryCand.Reason = GenericSchedulerBase::RegCritical;
-      return true;
-    }
-
-    // Same critical path, just prefer original candidate.
-    if (Cand.Reason > GenericSchedulerBase::RegCritical)
-      Cand.Reason = GenericSchedulerBase::RegCritical;
-
-    return true;
+    return false;
   };
 
   for (unsigned I = 0; I < HWUInfo.size(); I++) {
@@ -2154,9 +2163,8 @@ bool CandidateHeuristics::tryCriticalResourceDependency(
     if (!HasPrioritySU(I))
       continue;
 
-    bool Enabled = TryEnablesResource(I);
     // If neither has enabled the resource, continue to the next resource
-    if (Enabled)
+    if (TryEnablesResource(I))
       return true;
   }
 
@@ -2194,15 +2202,15 @@ bool CandidateHeuristics::tryCriticalResource(
       return true;
     }
 
-    // Otherwise, both use the critical resource
-    // For longer latency InstructionFlavors, we should prioritize first by
-    // their enablement of critical resources
-    if (HWUI.getType() == InstructionFlavor::DS ||
-        HWUI.getType() == InstructionFlavor::SALU ||
-        HWUI.getType() == InstructionFlavor::SingleCycleVALU) {
-      if (tryCriticalResourceDependency(TryCand, Cand, Zone))
-        return true;
-    }
+    // If we find both instructions use the same critical resource, this
+    // heuristic can't help decide which is better -- fall into later heuristics
+    // / tiebreakers. However, for HardwareUnits where we expect many long
+    // latency in-region dependencies (e.g. WMMA with multiple ds_load
+    // predecessors), it is better to tiebreak now on the HWUI priority. This
+    // honors the agreement between tryCriticalResourceDependency and
+    // tryCriticalResource.
+    if (HWUI.getType() != InstructionFlavor::WMMA)
+      return false;
 
     // Prioritize based on HWUI priorities.
     SUnit *Match = HWUI.getHigherPriority(Cand.SU, TryCand.SU);
@@ -2723,14 +2731,18 @@ bool AMDGPUCoExecSchedStrategy::tryCandidateCoexec(SchedCandidate &Cand,
       return TryCand.Reason != NoCand;
     }
 
-    Heurs.sortHWUIResources(Zone);
+    Heurs.sortHWUIResources(Zone, true);
     if (Heurs.tryCriticalResource(TryCand, Cand, Zone)) {
       LastAMDGPUReason = AMDGPUSchedReason::CritResourceBalance;
       return TryCand.Reason != NoCand;
     }
 
-    Heurs.sortHWUIResources(Zone, true);
     if (Heurs.tryCriticalResourceDependency(TryCand, Cand, Zone)) {
+      LastAMDGPUReason = AMDGPUSchedReason::CritResourceDep;
+      return TryCand.Reason != NoCand;
+    }
+
+    if (Heurs.tryCriticalResourcePrio(TryCand, Cand, Zone)) {
       LastAMDGPUReason = AMDGPUSchedReason::CritResourceDep;
       return TryCand.Reason != NoCand;
     }

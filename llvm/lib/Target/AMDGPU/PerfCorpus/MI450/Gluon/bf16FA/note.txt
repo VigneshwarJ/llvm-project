@@ -3,3 +3,6 @@ Migration target -- loop perf:
 
 Sched Perf
 1137 warm cycles
+
+Flags
+    --amdgpu-vgpr-excess-threshold-percent=85
