@@ -65,26 +65,41 @@ void CandidateHeuristics::sortHWUIResources(SchedBoundary *Zone,
         return A.getRemainingExposed() > B.getRemainingExposed();
     }
     
-    // 3. Higher TotalCycles = more demanded = higher priority
+    // 3. Prefer resources with more unready cycles (dependency sort)
+    if (UseDependencySort) {
+      unsigned AUnreadyCycles = A.getRemainingCycles() > MixInfo.getReadyCycles(A.getType())
+                                    ? (A.getRemainingCycles() - MixInfo.getReadyCycles(A.getType()))
+                                    : 0;
+      unsigned BUnreadyCycles = B.getRemainingCycles() > MixInfo.getReadyCycles(B.getType())
+                                    ? (B.getRemainingCycles() - MixInfo.getReadyCycles(B.getType()))
+                                    : 0;
+      if (AUnreadyCycles != BUnreadyCycles)
+        return AUnreadyCycles > BUnreadyCycles;
+    }
+    
+    // 4. Higher TotalCycles = more demanded = higher priority
     if (A.getTotalCycles() != B.getTotalCycles())
       return A.getTotalCycles() > B.getTotalCycles();
     
-    // 4. Fewer instructions = more cycles/instr = higher priority
+    // 5. Fewer instructions = more cycles/instr = higher priority
     if (A.size() != B.size())
       return A.size() < B.size();
     
-    // 5. Tie-break by flavor enum order
+    // 6. Tie-break by flavor enum order
     return static_cast<unsigned>(A.getType()) < static_cast<unsigned>(B.getType());
   });
 }
 ```
 
+**Note**: Both `tryCriticalResource` and `tryCriticalResourceDependency` now call `sortHWUIResources` with `UseDependencySort=true`. This unified sorting ensures both heuristics prefer resources with exposed cycles over those without, while also considering unready cycles for enabling blocked work.
+
 ### Sorting Priority Summary
 
 1. **Co-exec producers first**: WMMA, TRANS, MultiCycleVALU produce co-execution windows
 2. **RemainingExposed > 0**: Resources that will cause stalls if not prioritized
-3. **Higher TotalCycles**: More demanded resources
-4. **Fewer instructions**: Higher cycles per instruction (longer latency ops)
+3. **More unready cycles**: Resources with more blocked work (when `UseDependencySort=true`)
+4. **Higher TotalCycles**: More demanded resources
+5. **Fewer instructions**: Higher cycles per instruction (longer latency ops)
 
 ---
 
@@ -348,15 +363,14 @@ bool CandidateHeuristics::tryCriticalResource(
     }
 
     // Both use the same critical resource
-    // For shorter-latency flavors, defer to dependency-based prioritization
-    if (HWUI.getType() == InstructionFlavor::DS ||
-        HWUI.getType() == InstructionFlavor::SALU ||
-        HWUI.getType() == InstructionFlavor::SingleCycleVALU) {
-      if (tryCriticalResourceDependency(TryCand, Cand, Zone))
-        return true;
-    }
+    // Only use HWUI priority tiebreaking for WMMA - these have in-iteration
+    // dependencies on long-latency DS instructions, so we want to honor the
+    // agreement between tryCriticalResourceDep and tryCriticalResource on
+    // which instruction to prioritize.
+    if (HWUI.getType() != InstructionFlavor::WMMA)
+      return false;
 
-    // Use HWUI's internal priority ordering
+    // Use HWUI's internal priority ordering for WMMA
     SUnit *Match = HWUI.getHigherPriority(Cand.SU, TryCand.SU);
     if (Match) {
       if (Match == Cand.SU) {
@@ -374,13 +388,11 @@ bool CandidateHeuristics::tryCriticalResource(
 
 ### Tie-breaking On Same HardwareUnit
 
-The primary mechanism that tryCriticalResource is to make decisions about `SchedCandidates` that use different HardwareUnitInfos. However, in the cases where we are comparing two `SchedCandidates` which use the same HardwareUnitInfo, we have several tiebreakers.
+The primary mechanism of tryCriticalResource is to make decisions about `SchedCandidates` that use different HardwareUnitInfos. When comparing two `SchedCandidates` which use the same HardwareUnitInfo, the behavior depends on the instruction type:
 
-While populating the HardwareUnits based on the instructions in the scheduling region, we maintain a priority list of instructions, sorted by depth. This ordering is mainly so that different heuristics (e.g. tryCriticalResourceDependency) can agree on which instruction to prioritize scheudling next.
+**For WMMA instructions**: We use the HWUI's internal priority ordering (`getHigherPriority`). In typical GEMM kernels, WMMA instructions have in-iteration dependencies on long-latency DS instructions. Using HWUI priority ensures agreement between `tryCriticalResourceDependency` and `tryCriticalResource` on which WMMA to target - when deciding which DS loads to schedule as WMMA predecessors, both heuristics agree on the target WMMA SU.
 
-For example, in a typical GEMM kernel, we may have may ds_loads which are dependencies for the same WMMA. Since we have an ordering on the HardwareUnitInfo, when deciding which ds_loads to schedule as WMMA predecessors, tryCriticalResourceDependency and tryCriticalResource can agree on the `Target` SU.
-
-However, for many HardwareUnitInfos, having this agreement isn't required (having good ordering between an instruction and its predecessors is not performance critical). For these, we tiebreak on tryCriticalResourceDependency.
+**For non-WMMA instructions**: We return `false` immediately, deferring the decision to later heuristics (`tryCriticalResourceDependency` and `tryCriticalResourcePrio`). For most resources, the agreement on priority ordering isn't as critical, so we let the dependency-based heuristic decide based on enablement of lower-priority resources.
 
 ---
 
@@ -718,5 +730,11 @@ The `tryCriticalResource` heuristic works in concert with `sortHWUIResources` to
 4. **Dynamically re-prioritize** as resources are consumed during scheduling
 5. **Prefer instructions** that use the highest-priority (most critical) resource
 6. **Shift critical resources** as the scheduling progresses and pressure changes
+7. **WMMA-specific tiebreaking**: Only use HWUI priority ordering for WMMA instructions; defer to later heuristics for other flavors
+
+The heuristic ordering is:
+- `tryCriticalResource`: Decides between candidates using different resources; for same-resource WMMA, uses HWUI priority
+- `tryCriticalResourceDependency`: Decides based on which candidate enables a higher-priority resource
+- `tryCriticalResourcePrio`: Final depth-based tiebreaking using HWUI priority for any resource type
 
 The key insight is that **critical resources change dynamically** as scheduling proceeds. A resource that starts as critical may become less so after its instructions are scheduled, causing another resource to become the new bottleneck. The roofline analysis provides the initial "budget" of exposed cycles, and the scheduler tracks consumption to maintain accurate priorities throughout the scheduling process.
