@@ -81,9 +81,12 @@ If `Cand.SU` is a predecessor of `TargetSU` (directly or transitively), then sch
 
 ---
 
-## useDependencySort: Ready-Cycle Aware Sorting
+## sortHWUIResources: Unified Sorting for Both Heuristics
 
-When `tryCriticalResourceDependency` is invoked, the precondition is that the HardwareUnits are sorted in terms of highest priority to enable. The HWUI list is sorted with `UseDependencySort=true`. This is the only metric that it unique to sorting for `tryCriticalResourceDependency`; aside from this, we use the regular metrics used for `tryCriticalResource` sorting. The `UseDependencySort=true` sort mode prioritizes resources based on **unready cycles**—cycles of work that cannot be scheduled yet because their instructions are blocked by dependencies. 
+Both `tryCriticalResource` and `tryCriticalResourceDependency` now use the same sorting with `UseDependencySort=true`. The HWUI list is sorted to prioritize:
+
+1. **Exposed cycles first**: Resources with `RemainingExposed > 0` are always prioritized - we want to be able to schedule resources with exposed cycles over those without
+2. **Unready cycles**: Among resources with the same exposed status, prefer those with more unready cycles—cycles of work that cannot be scheduled yet because their instructions are blocked by dependencies 
 
 ### RegionMixInfo
 
@@ -112,7 +115,7 @@ void RegionMixInfo::refreshFromBoundary(SchedBoundary &Zone, ...) {
 }
 ```
 
-### The Dependency Sort Logic
+### The Sort Logic
 
 ```cpp
 void CandidateHeuristics::sortHWUIResources(SchedBoundary *Zone,
@@ -121,11 +124,24 @@ void CandidateHeuristics::sortHWUIResources(SchedBoundary *Zone,
     MixInfo.refreshFromBoundary(*Zone, *SII, this);
 
   llvm::sort(HWUInfo, [UseExposed, UseDependencySort, this](...) {
+    // 1. CoexecWindow producers first (WMMA, TRANS, MultiCycleVALU)
+    if (A.producesCoexecWindow() != B.producesCoexecWindow())
+      return A.producesCoexecWindow();
+    
+    // 2. Prefer resources with non-zero RemainingExposed
+    if (UseExposed) {
+      bool AExp = A.getRemainingExposed() > 0;
+      bool BExp = B.getRemainingExposed() > 0;
+      if (AExp != BExp)
+        return AExp;  // Has exposed cycles = higher priority
+      if (A.getRemainingExposed() != B.getRemainingExposed())
+        return A.getRemainingExposed() > B.getRemainingExposed();
+    }
+    
+    // 3. Prefer resources with more unready cycles
     if (UseDependencySort) {
-      // ReadyCycles: cycles of work that is DAG-ready NOW
       unsigned AReadyCycles = MixInfo.getReadyCycles(A.getType());
       unsigned ARemainingCycles = A.getRemainingCycles();
-      // UnreadyCycles: cycles of work still blocked by dependencies
       unsigned AUnreadyCycles = ARemainingCycles > AReadyCycles
                                     ? (ARemainingCycles - AReadyCycles)
                                     : 0;
@@ -136,16 +152,15 @@ void CandidateHeuristics::sortHWUIResources(SchedBoundary *Zone,
                                     ? (BRemainingCycles - BReadyCycles)
                                     : 0;
 
-      // Prefer the resource with MORE unready cycles
       if (AUnreadyCycles != BUnreadyCycles)
         return AUnreadyCycles > BUnreadyCycles;
     }
-    // ... fallthrough to normal sorting criteria
+    // ... fallthrough to TotalCycles, size, flavor order
   });
 }
 ```
 
-**Intuition**: A resource with many unready cycles has a lot of blocked work. Enabling that work is valuable because it unblocks a larger pool of potential instructions. By sorting these resources first, `tryCriticalResourceDependency` will check whether candidates enable the most "blocked" resources before checking less-blocked ones.
+**Key insight**: Exposed cycles take precedence over unready cycles. We always want to be able to schedule resources with exposed cycles over those without, because exposed cycles represent work that will contribute to the critical path and cause stalls. Within each group (exposed vs non-exposed), we then prefer resources with more unready cycles because enabling blocked work is valuable.
 
 ---
 
@@ -213,7 +228,7 @@ bool CandidateHeuristics::tryCriticalResourceDependency(
     return true;
   };
 
-  // Iterate through HWUIs in priority order (sorted by unready cycles)
+  // Iterate through HWUIs in priority order (sorted by exposed then unready)
   for (unsigned I = 0; I < HWUInfo.size(); I++) {
     if (!HasPrioritySU(I))
       continue;
@@ -231,7 +246,7 @@ bool CandidateHeuristics::tryCriticalResourceDependency(
 
 ### Decision Flow
 
-1. **Sort HWUIs by unready cycles** (via `UseDependencySort=true`)
+1. **Sort HWUIs by exposed cycles, then unready cycles** (via `UseDependencySort=true`)
 2. **For each HWUI in priority order**:
    - Get the TargetSU (highest-priority unscheduled instruction)
    - Skip if no TargetSU exists
@@ -239,6 +254,8 @@ bool CandidateHeuristics::tryCriticalResourceDependency(
    - If only one enables: prefer that one
    - If both enable: prefer higher critical path height
 3. **Fallback to loop-carried ordering** if no decision was made
+
+**Note**: Tiebreaking is done on enablement of lower priority critical resources, with depth tiebreaking handled by a later heuristic (`tryCriticalResourcePrio`).
 
 ---
 
@@ -510,39 +527,35 @@ Current State:
 
 ---
 
-## Interaction with tryCriticalResource
+## Interaction with tryCriticalResource and tryCriticalResourcePrio
 
-The two heuristics complement each other:
+The three heuristics work together in sequence:
 
-| Heuristic | Question | When Called |
-|-----------|----------|-------------|
-| `tryCriticalResource` | "Which candidate uses the most critical resource?" | First, without dependency sort |
-| `tryCriticalResourceDependency` | "Which candidate enables the most critical resource?" | Second, with dependency sort |
+| Heuristic | Question | Sorting |
+|-----------|----------|---------|
+| `tryCriticalResource` | "Which candidate uses a higher-priority resource?" | `UseDependencySort=true` |
+| `tryCriticalResourceDependency` | "Which candidate enables a higher-priority resource?" | `UseDependencySort=true` |
+| `tryCriticalResourcePrio` | "Which candidate has higher HWUI priority?" | (uses existing sort) |
 
 ```cpp
 // From tryCandidateCoexec()
-Heurs.sortHWUIResources(Zone);          // Normal sort
+Heurs.sortHWUIResources(Zone, true);    // Unified sort with dependency awareness
 if (Heurs.tryCriticalResource(...))     // Check resource usage
   return ...;
 
-Heurs.sortHWUIResources(Zone, true);    // Dependency sort
+Heurs.sortHWUIResources(Zone, true);    // Same sort
 if (Heurs.tryCriticalResourceDependency(...))  // Check enablement
+  return ...;
+
+if (Heurs.tryCriticalResourcePrio(...)) // HWUI priority tiebreaking
   return ...;
 ```
 
-For short-latency flavors (DS, SALU, SingleCycleVALU), `tryCriticalResource` delegates to `tryCriticalResourceDependency` when both candidates use the same HWUI:
+**Key design change**: `tryCriticalResource` now only uses HWUI priority tiebreaking for WMMA instructions. For all other flavors, when both candidates use the same resource, it returns `false` and defers to `tryCriticalResourceDependency` (enablement-based) and then `tryCriticalResourcePrio` (depth-based priority).
 
-```cpp
-// Inside tryCriticalResource
-if (HWUI.getType() == InstructionFlavor::DS ||
-    HWUI.getType() == InstructionFlavor::SALU ||
-    HWUI.getType() == InstructionFlavor::SingleCycleVALU) {
-  if (tryCriticalResourceDependency(TryCand, Cand, Zone))
-    return true;
-}
-```
-
-This delegation ensures that when comparing two DS loads, we pick the one that enables the more critical consumer. For SALU & SingleCycleVALU, these are generally used to enable other resources, so it is best to focus on their enablement rather than honoring the HardwareResource agreemenmt on the next target SU.
+This separation ensures:
+1. **WMMA**: Agreement between `tryCriticalResource` and `tryCriticalResourceDependency` on target SU (important due to in-iteration DS→WMMA dependencies)
+2. **Other flavors**: Enablement-based decisions take precedence, with depth tiebreaking handled by `tryCriticalResourcePrio`
 
 ---
 
@@ -550,10 +563,11 @@ This delegation ensures that when comparing two DS loads, we pick the one that e
 
 The `tryCriticalResourceDependency` heuristic implements a **dependency-aware scheduling strategy**:
 
-1. **Target Selection**: Each HWUI tracks its highest-priority unscheduled instruction - this allows agreement between `tryCriticalResourceDependency` and `tryCriticalResource`
-2. **Enablement Check**: Prefer candidates that enable critical targets via DAG reachability
-3. **Dependency Sort**: Sort resources by unready cycles to prioritize enabling blocked work
+1. **Target Selection**: Each HWUI tracks its highest-priority unscheduled instruction - this allows agreement between `tryCriticalResourceDependency` and `tryCriticalResource` (especially important for WMMA)
+2. **Unified Sorting**: Both `tryCriticalResource` and `tryCriticalResourceDependency` use `UseDependencySort=true`, prioritizing exposed cycles over unready cycles
+3. **Enablement Check**: Prefer candidates that enable critical targets via DAG reachability
 4. **Loop-Carried Fallback**: For software-pipelined loops, order DS loads by next-iteration consumption
 5. **Critical Path Tie-Break**: When both candidates enable the same target, prefer higher height
+6. **Deferred Depth Tiebreaking**: Explicit depth-based tiebreaking is handled by `tryCriticalResourcePrio`, called after this heuristic
 
 The key insight is that by unblocking critical resources early, the scheduler creates more scheduling flexibility and reduces register pressure from long live ranges.
