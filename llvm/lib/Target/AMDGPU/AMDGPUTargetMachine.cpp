@@ -676,6 +676,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAMDGPUTarget() {
   initializeSILowerSGPRSpillsLegacyPass(*PR);
   initializeSIFixSGPRCopiesLegacyPass(*PR);
   initializeSISGPRCopyOptLegacyPass(*PR);
+  initializeSILoopCarriedCopyOptLegacyPass(*PR);
   initializeSIFixVGPRCopiesLegacyPass(*PR);
   initializeSIFoldOperandsLegacyPass(*PR);
   initializeSIPeepholeSDWALegacyPass(*PR);
@@ -1924,6 +1925,7 @@ void GCNPassConfig::addPreSched2() {
     // Eliminate redundant SGPR->VGPR->SGPR copy sequences that arise from
     // PHI resolution when accumulators are initialized from SGPRs
     addPass(&SISGPRCopyOptLegacyID);
+    addPass(&SILoopCarriedCopyOptLegacyID);
     addPass(createSIShrinkInstructionsLegacyPass());
   }
   addPass(&SIPostRABundlerLegacyID);

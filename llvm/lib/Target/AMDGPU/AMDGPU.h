@@ -51,6 +51,7 @@ FunctionPass *createAMDGPUNextUseAnalysisLegacyPass();
 FunctionPass *createAMDGPUNextUseAnalysisPrinterLegacyPass();
 FunctionPass *createSIFixSGPRCopiesLegacyPass();
 FunctionPass *createSISGPRCopyOptLegacyPass();
+FunctionPass *createSILoopCarriedCopyOptLegacyPass();
 FunctionPass *createLowerWWMCopiesPass();
 FunctionPass *createSIMemoryLegalizerPass();
 FunctionPass *createSIInsertWaitcntsPass();
@@ -203,6 +204,9 @@ extern char &SIFixSGPRCopiesLegacyID;
 
 void initializeSISGPRCopyOptLegacyPass(PassRegistry &);
 extern char &SISGPRCopyOptLegacyID;
+
+void initializeSILoopCarriedCopyOptLegacyPass(PassRegistry &);
+extern char &SILoopCarriedCopyOptLegacyID;
 
 void initializeSIFixVGPRCopiesLegacyPass(PassRegistry &);
 extern char &SIFixVGPRCopiesID;
