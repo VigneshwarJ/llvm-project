@@ -44,6 +44,7 @@
 #include "AMDGPU.h"
 #include "GCNSubtarget.h"
 #include "MCTargetDesc/AMDGPUMCTargetDesc.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/CodeGen/MachineLoopInfo.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/InitializePasses.h"
@@ -56,6 +57,14 @@ static cl::opt<bool> EnableSGPRCopyOpt(
     "amdgpu-enable-sgpr-copy-opt",
     cl::desc("Hoist loop-invariant SGPR->VGPR copies to loop preheaders"),
     cl::init(true));
+
+// Upper bound on the number of copies hoisted out of a single loop. Because a
+// hoisted copy's destination is provably not redefined in the loop, hoisting is
+// occupancy-neutral post-RA; this knob only throttles the transform while
+// investigating scheduling interactions. 0 means unlimited.
+static cl::opt<unsigned> MaxHoistPerLoop(
+    "amdgpu-sgpr-copy-opt-max-hoist", cl::init(0), cl::Hidden,
+    cl::desc("Max SGPR->VGPR copies to hoist per loop (0 = unlimited)"));
 
 namespace {
 
@@ -78,6 +87,21 @@ private:
 
   /// Check if a V_MOV instruction can be hoisted to the preheader.
   bool canHoistMov(MachineInstr &MI, MachineLoop *Loop) const;
+
+  /// Check whether Reg is defined by any instruction in the loop other than
+  /// Except (overlapping registers count). Used to guarantee a hoisted MOV is
+  /// the sole in-loop definition of its destination.
+  bool isRegDefinedInLoop(Register Reg, MachineLoop *Loop,
+                          const MachineInstr *Except) const;
+
+  /// Check whether Reg is referenced anywhere in the preheader, which would
+  /// make inserting a redefining MOV there unsafe.
+  bool isRegTouchedInPreheader(Register Reg,
+                               MachineBasicBlock *Preheader) const;
+
+  /// Check whether MI's destination DstReg is fully overwritten before any use
+  /// later in the same block, which makes the MOV dead and safe to delete.
+  bool isMovDeadInBlock(MachineInstr &MI, Register DstReg) const;
 
   /// Hoist eligible V_MOV instructions from loop header to preheader.
   bool hoistLoopInvariantCopies(MachineLoop *Loop);
@@ -147,6 +171,68 @@ bool SISGPRCopyOpt::isLoopInvariantSGPR(Register Reg, MachineLoop *Loop) const {
   return true;
 }
 
+bool SISGPRCopyOpt::isRegDefinedInLoop(Register Reg, MachineLoop *Loop,
+                                       const MachineInstr *Except) const {
+  for (MachineBasicBlock *MBB : Loop->blocks()) {
+    for (MachineInstr &MI : *MBB) {
+      if (&MI == Except)
+        continue;
+      for (const MachineOperand &MO : MI.operands()) {
+        if (MO.isReg() && MO.isDef() && MO.getReg().isPhysical() &&
+            TRI->regsOverlap(MO.getReg(), Reg))
+          return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool SISGPRCopyOpt::isRegTouchedInPreheader(
+    Register Reg, MachineBasicBlock *Preheader) const {
+  for (MachineInstr &MI : *Preheader) {
+    for (const MachineOperand &MO : MI.operands()) {
+      if (MO.isReg() && MO.getReg().isPhysical() &&
+          TRI->regsOverlap(MO.getReg(), Reg))
+        return true;
+    }
+  }
+  return false;
+}
+
+bool SISGPRCopyOpt::isMovDeadInBlock(MachineInstr &MI, Register DstReg) const {
+  // Register units of the destination that must be redefined before any use for
+  // the MOV to be dead.
+  SmallDenseSet<MCRegUnit, 16> NeededUnits;
+  for (MCRegUnit U : TRI->regunits(DstReg.asMCReg()))
+    NeededUnits.insert(U);
+
+  MachineBasicBlock *MBB = MI.getParent();
+  for (auto I = std::next(MI.getIterator()); I != MBB->end(); ++I) {
+    // A read of any still-live unit means the MOV's value is consumed, so it is
+    // not dead. Check uses before defs so a read-modify-write counts as a use.
+    for (const MachineOperand &MO : I->operands()) {
+      if (!MO.isReg() || !MO.getReg().isPhysical() || !MO.isUse() ||
+          MO.isUndef())
+        continue;
+      for (MCRegUnit U : TRI->regunits(MO.getReg().asMCReg()))
+        if (NeededUnits.contains(U))
+          return false;
+    }
+    // Retire the units this instruction overwrites.
+    for (const MachineOperand &MO : I->operands()) {
+      if (MO.isReg() && MO.isDef() && MO.getReg().isPhysical())
+        for (MCRegUnit U : TRI->regunits(MO.getReg().asMCReg()))
+          NeededUnits.erase(U);
+    }
+    if (NeededUnits.empty())
+      return true; // fully redefined before any use within the block
+  }
+
+  // Reached the end of the block without a full redefinition: the value may be
+  // live-out. Be conservative.
+  return false;
+}
+
 bool SISGPRCopyOpt::canHoistMov(MachineInstr &MI, MachineLoop *Loop) const {
   unsigned Opc = MI.getOpcode();
 
@@ -197,6 +283,19 @@ bool SISGPRCopyOpt::canHoistMov(MachineInstr &MI, MachineLoop *Loop) const {
     }
   }
 
+  // The hoisted MOV must be the only in-loop definition of the destination. If
+  // anything else in the loop writes it (e.g. a load into the data half of a
+  // matrix operand, or reuse of the physical VGPR as scratch), removing the
+  // per-iteration MOV would let a later iteration read the clobbered value.
+  if (isRegDefinedInLoop(DstReg, Loop, &MI))
+    return false;
+
+  // Do not clobber a value the preheader itself defines or consumes: the copy
+  // is inserted before the preheader terminator.
+  if (MachineBasicBlock *Preheader = Loop->getLoopPreheader())
+    if (isRegTouchedInPreheader(DstReg, Preheader))
+      return false;
+
   return true;
 }
 
@@ -212,6 +311,7 @@ bool SISGPRCopyOpt::hoistLoopInvariantCopies(MachineLoop *Loop) {
 
   bool Changed = false;
   SmallVector<MachineInstr *, 16> ToHoist;
+  SmallVector<MachineInstr *, 16> ToDelete;
 
   // Collect movs to hoist - only look at the beginning of the header
   // (before any other non-copy/non-mov instructions)
@@ -223,15 +323,34 @@ bool SISGPRCopyOpt::hoistLoopInvariantCopies(MachineLoop *Loop) {
         Opc != AMDGPU::ATOMIC_FENCE && Opc != AMDGPU::WAVE_BARRIER)
       break;
 
-    if ((Opc == AMDGPU::V_MOV_B64_e32 || Opc == AMDGPU::V_MOV_B32_e32) &&
-        canHoistMov(MI, Loop))
+    if (Opc != AMDGPU::V_MOV_B64_e32 && Opc != AMDGPU::V_MOV_B32_e32)
+      continue;
+
+    bool HoistCapReached = MaxHoistPerLoop && ToHoist.size() >= MaxHoistPerLoop;
+    if (!HoistCapReached && canHoistMov(MI, Loop)) {
       ToHoist.push_back(&MI);
+      continue;
+    }
+
+    // Not hoistable: delete it if it is provably dead within the loop. This
+    // reclaims the pad fills that a later load overwrites before any use,
+    // without the risk of hoisting a register that is redefined in the loop.
+    Register DstReg = MI.getOperand(0).getReg();
+    if (DstReg.isPhysical() && TRI->isVGPR(*MRI, DstReg) &&
+        isMovDeadInBlock(MI, DstReg))
+      ToDelete.push_back(&MI);
   }
 
   for (MachineInstr *MI : ToHoist) {
     LLVM_DEBUG(dbgs() << "Hoisting to preheader: " << *MI);
     MI->removeFromParent();
     Preheader->insert(InsertPt, MI);
+    Changed = true;
+  }
+
+  for (MachineInstr *MI : ToDelete) {
+    LLVM_DEBUG(dbgs() << "Deleting dead loop MOV: " << *MI);
+    MI->eraseFromParent();
     Changed = true;
   }
 
