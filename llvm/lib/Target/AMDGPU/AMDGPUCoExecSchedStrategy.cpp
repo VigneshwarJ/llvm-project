@@ -684,8 +684,7 @@ void RegionMixInfo::refreshFromBoundary(SchedBoundary &Zone,
   // Pending entries would cause a structural stall this cycle but are still
   // candidates the picker may select, so ShadowMix counts them as "ready".
   auto Bump = [&](SUnit *SU) {
-    unsigned Idx =
-        static_cast<unsigned>(classifyFlavor(*SU->getInstr(), SII));
+    unsigned Idx = static_cast<unsigned>(Heurs->getFlavor(SU));
     ReadyCount[Idx]++;
     ReadyCycles[Idx] += Heurs->getHWUICyclesForSU(SU);
   };
@@ -1298,7 +1297,7 @@ unsigned CandidateHeuristics::getHWUICyclesForMI(MachineInstr *MI) {
 
 void CandidateHeuristics::updateForScheduling(SUnit *SU,
                                               SchedBoundary *Zone) {
-  auto Flavor = classifyFlavor(*SU->getInstr(), *SII);
+  auto Flavor = getFlavor(SU);
   unsigned Latency = getHWUICyclesForSU(SU);
   HardwareUnitInfo *HWUI = getHWUIFromFlavor(Flavor);
   assert(HWUI);
@@ -1306,6 +1305,7 @@ void CandidateHeuristics::updateForScheduling(SUnit *SU,
   MixInfo.recordScheduled(Flavor);
   // Mix snapshot is now stale; tryShadowMix will refresh on its next call.
   MixInfo.invalidate();
+  ++NumScheduledInRegion;
 
   // Record consumption of loop-carried DS_READs. The recorder is
   // per-first-use only and self-terminates once every loop-carried vreg
@@ -1391,6 +1391,17 @@ void CandidateHeuristics::initialize(ScheduleDAGMI *SchedDAG,
     ShadowMixNodeBudget = std::numeric_limits<unsigned>::max();
   }
   AncestorCache.clear();
+  ReachableCache.clear();
+
+  SUFlavors.clear();
+  SUFlavors.reserve(DAG->SUnits.size());
+  for (const SUnit &SU : DAG->SUnits)
+    SUFlavors.push_back(classifyFlavor(*SU.getInstr(), *SII));
+  NumScheduledInRegion = 0;
+  for (ShadowMixLookaheadCache &C : ShadowMixLookahead)
+    C.NearestValid = C.TargetsValid = false;
+  BFSVisited.assign(DAG->SUnits.size(), 0);
+  BFSVisitMark = 0;
 
   HWUInfo.resize((int)InstructionFlavor::NUM_FLAVORS);
 
@@ -2633,9 +2644,9 @@ bool CandidateHeuristics::tryMemoryPipeline(
     GenericSchedulerBase::SchedCandidate &TryCand,
     GenericSchedulerBase::SchedCandidate &Cand, SchedBoundary *Zone) {
 
-  InstructionFlavor TryFlavor = classifyFlavor(*TryCand.SU->getInstr(), *SII);
+  InstructionFlavor TryFlavor = getFlavor(TryCand.SU);
 
-  InstructionFlavor CandFlavor = classifyFlavor(*Cand.SU->getInstr(), *SII);
+  InstructionFlavor CandFlavor = getFlavor(Cand.SU);
 
   bool TryIsMemoryPipeline = TryFlavor == InstructionFlavor::DMA ||
                              TryFlavor == InstructionFlavor::Fence;
@@ -2681,8 +2692,8 @@ bool CandidateHeuristics::tryCoexecSlot(
 
   const CoExecInfo &Info = HazardRec->getActiveCoExecInfo();
 
-  InstructionFlavor TryFlavor = classifyFlavor(*TryCand.SU->getInstr(), *SII);
-  InstructionFlavor CandFlavor = classifyFlavor(*Cand.SU->getInstr(), *SII);
+  InstructionFlavor TryFlavor = getFlavor(TryCand.SU);
+  InstructionFlavor CandFlavor = getFlavor(Cand.SU);
 
   StallCosts TryStallCost;
   StallCosts CandStallCost;
@@ -2742,8 +2753,8 @@ bool CandidateHeuristics::tryCriticalResourceDependency(
   auto HasPrioritySU = [this, &Cand, &TryCand](unsigned ResourceIdx) {
     const HardwareUnitInfo &HWUI = HWUInfo[ResourceIdx];
 
-    auto CandFlavor = classifyFlavor(*Cand.SU->getInstr(), *SII);
-    auto TryCandFlavor = classifyFlavor(*TryCand.SU->getInstr(), *SII);
+    auto CandFlavor = getFlavor(Cand.SU);
+    auto TryCandFlavor = getFlavor(TryCand.SU);
     bool LookDeep = (CandFlavor == InstructionFlavor::DS ||
                      TryCandFlavor == InstructionFlavor::DS) &&
                     HWUI.getType() == InstructionFlavor::WMMA;
@@ -2758,7 +2769,7 @@ bool CandidateHeuristics::tryCriticalResourceDependency(
 
   auto TryEnablesResource = [&Cand, &TryCand, this](unsigned ResourceIdx) {
     const HardwareUnitInfo &HWUI = HWUInfo[ResourceIdx];
-    auto CandFlavor = classifyFlavor(*Cand.SU->getInstr(), *SII);
+    auto CandFlavor = getFlavor(Cand.SU);
 
     // We want to ensure our DS order matches WMMA order.
     bool LookDeep = CandFlavor == InstructionFlavor::DS &&
@@ -2877,23 +2888,61 @@ unsigned CandidateHeuristics::countDirectlyEnabledByFlavor(
     SUnit *SuccSU = Succ.getSUnit();
     if (SuccSU->isScheduled || SuccSU->NumPredsLeft != 1 || !SuccSU->getInstr())
       continue;
-    if (classifyFlavor(*SuccSU->getInstr(), *SII) == TargetFlavor)
+    if (getFlavor(SuccSU) == TargetFlavor)
       ++Count;
   }
   return Count;
 }
 
+CandidateHeuristics::ShadowMixLookaheadCache &
+CandidateHeuristics::getShadowMixLookahead(InstructionFlavor F) {
+  ShadowMixLookaheadCache &C = ShadowMixLookahead[static_cast<unsigned>(F)];
+  if (C.Epoch != NumScheduledInRegion) {
+    C.Epoch = NumScheduledInRegion;
+    C.NearestValid = C.TargetsValid = false;
+  }
+  return C;
+}
+
+ArrayRef<SUnit *>
+CandidateHeuristics::getShadowMixTargets(InstructionFlavor F,
+                                         unsigned MaxTargets) {
+  ShadowMixLookaheadCache &C = getShadowMixLookahead(F);
+  if (!C.TargetsValid) {
+    C.Targets.clear();
+    for (SUnit &SU : DAG->SUnits) {
+      if (C.Targets.size() >= MaxTargets)
+        break;
+      if (!SU.isScheduled && !SU.isTopReady() && getFlavor(&SU) == F)
+        C.Targets.push_back(&SU);
+    }
+    C.TargetsValid = true;
+  }
+  return C.Targets;
+}
+
 std::optional<unsigned> CandidateHeuristics::findNearestPendingByFlavor(
     InstructionFlavor TargetFlavor, unsigned MaxDepth) {
+  ShadowMixLookaheadCache &C = getShadowMixLookahead(TargetFlavor);
+  if (C.NearestValid)
+    return C.NearestDist;
+
   // BFS from all currently ready SUs to find nearest pending SU of
   // TargetFlavor.
   SmallVector<std::pair<SUnit *, unsigned>, 32> Worklist;
-  SmallPtrSet<SUnit *, 32> Visited;
+  ++BFSVisitMark;
+  bool ExitVisited = false;
+  // Returns true if SU was not visited yet, and marks it.
+  auto Visit = [&](const SUnit *SU) {
+    if (SU->NodeNum >= BFSVisited.size())
+      return !std::exchange(ExitVisited, true);
+    return std::exchange(BFSVisited[SU->NodeNum], BFSVisitMark) != BFSVisitMark;
+  };
 
   for (auto &SU : DAG->SUnits) {
     if (!SU.isScheduled && SU.isTopReady()) {
       Worklist.push_back({&SU, 0});
-      Visited.insert(&SU);
+      Visit(&SU);
     }
   }
 
@@ -2914,7 +2963,7 @@ std::optional<unsigned> CandidateHeuristics::findNearestPendingByFlavor(
       continue;
 
     if (!SU->isTopReady() && !SU->isScheduled && SU->getInstr()) {
-      if (classifyFlavor(*SU->getInstr(), *SII) == TargetFlavor) {
+      if (getFlavor(SU) == TargetFlavor) {
         if (!BestDist || Depth < *BestDist)
           BestDist = Depth;
         continue; // Don't expand past target
@@ -2925,17 +2974,22 @@ std::optional<unsigned> CandidateHeuristics::findNearestPendingByFlavor(
       if (Succ.isWeak())
         continue;
       SUnit *SuccSU = Succ.getSUnit();
-      if (SuccSU->isScheduled || Visited.count(SuccSU))
+      if (SuccSU->isScheduled || !Visit(SuccSU))
         continue;
-      Visited.insert(SuccSU);
       Worklist.push_back({SuccSU, Depth + 1});
     }
   }
+  C.NearestDist = BestDist;
+  C.NearestValid = true;
   return BestDist;
 }
 
 bool CandidateHeuristics::wouldHelpEnable(SUnit *SU, SUnit *TargetSU) {
-  return DAG->IsReachable(TargetSU, SU);
+  auto [It, Inserted] =
+      ReachableCache.try_emplace({SU->NodeNum, TargetSU->NodeNum}, false);
+  if (Inserted)
+    It->second = DAG->IsReachable(TargetSU, SU);
+  return It->second;
 }
 
 bool CandidateHeuristics::candEnablesTarget(const SUnit *Cand,
@@ -2984,8 +3038,8 @@ bool CandidateHeuristics::tryShadowMix(
     GenericSchedulerBase::SchedCandidate &TryCand,
     GenericSchedulerBase::SchedCandidate &Cand, SchedBoundary *Zone) {
 
-  auto CandFlavor = classifyFlavor(*Cand.SU->getInstr(), *SII);
-  auto TryCandFlavor = classifyFlavor(*TryCand.SU->getInstr(), *SII);
+  auto CandFlavor = getFlavor(Cand.SU);
+  auto TryCandFlavor = getFlavor(TryCand.SU);
 
   // Refresh ready-mix snapshot from the boundary's queues. No-op if the
   // snapshot is still valid (cleared on schedNode).
@@ -3118,19 +3172,10 @@ bool CandidateHeuristics::tryShadowMix(
     // short-circuit their wouldHelpEnable check to false, so the loop body
     // would never decide anything and we would burn the budget for nothing.
     if (!CandMatchesProducer || !TryCandMatchesProducer) {
-      unsigned RemainingBudget = ShadowMixIsReachableBudget;
-      for (auto &SU : DAG->SUnits) {
-        if (!SU.getInstr() || SU.isScheduled || SU.isTopReady())
-          continue;
-        if (classifyFlavor(*SU.getInstr(), *SII) != NeededFlavor)
-          continue;
-
-        // Each surviving iteration costs up to two IsReachable calls. Stop
-        // probing once the budget cannot cover another pair.
-        if (RemainingBudget < 2)
-          break;
-        RemainingBudget -= 2;
-
+      // Each target costs up to two IsReachable calls.
+      for (SUnit *Target :
+           getShadowMixTargets(NeededFlavor, ShadowMixIsReachableBudget / 2)) {
+        SUnit &SU = *Target;
         bool CandHelps =
             !CandMatchesProducer && wouldHelpEnable(Cand.SU, &SU);
         bool TryCandHelps =

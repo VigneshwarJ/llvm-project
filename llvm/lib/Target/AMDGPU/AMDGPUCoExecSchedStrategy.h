@@ -584,6 +584,44 @@ protected:
   /// enable \p TargetSU.
   bool wouldHelpEnable(SUnit *SU, SUnit *TargetSU);
 
+  /// wouldHelpEnable() results keyed by (SU, TargetSU) NodeNums. DAG edges do
+  /// not change while a region is scheduled.
+  DenseMap<std::pair<unsigned, unsigned>, bool> ReachableCache;
+
+  /// classifyFlavor() of every region SUnit, indexed by NodeNum. An
+  /// instruction's flavor does not change while its region is scheduled.
+  SmallVector<AMDGPU::InstructionFlavor, 0> SUFlavors;
+
+  /// Number of SUnits scheduled so far in the region. Lookahead results that
+  /// depend only on the scheduled set are valid while this is unchanged.
+  unsigned NumScheduledInRegion = 0;
+
+  /// Candidate-independent ShadowMix lookahead state for one target flavor,
+  /// computed at most once per scheduled SUnit instead of once per candidate
+  /// pair.
+  struct ShadowMixLookaheadCache {
+    bool NearestValid = false;
+    bool TargetsValid = false;
+    unsigned Epoch = 0;
+    std::optional<unsigned> NearestDist;
+    /// The first pending SUnits of the flavor in NodeNum order, at most
+    /// ShadowMixIsReachableBudget / 2 of them.
+    SmallVector<SUnit *, 32> Targets;
+  };
+  ShadowMixLookaheadCache ShadowMixLookahead[static_cast<unsigned>(
+      AMDGPU::InstructionFlavor::NUM_FLAVORS)];
+
+  /// Visit marks for findNearestPendingByFlavor, indexed by NodeNum. An
+  /// SUnit is visited in the current BFS iff its mark equals BFSVisitMark.
+  SmallVector<unsigned, 0> BFSVisited;
+  unsigned BFSVisitMark = 0;
+
+  ShadowMixLookaheadCache &getShadowMixLookahead(AMDGPU::InstructionFlavor F);
+
+  /// \returns the pending SUnits of \p F scanned by the ShadowMix lookahead.
+  ArrayRef<SUnit *> getShadowMixTargets(AMDGPU::InstructionFlavor F,
+                                        unsigned MaxTargets);
+
   /// MachineLoopInfo for the current function. May be null; only consulted
   /// by the loop-body gate of the DS_READ-by-consumer-order tie-breaker,
   /// which falls back to a self-edge check when MLI is unavailable.
@@ -623,6 +661,13 @@ public:
   void initialize(ScheduleDAGMI *DAG, const TargetSchedModel *SchedModel,
                   const TargetRegisterInfo *TRI,
                   const MachineLoopInfo *MLI = nullptr);
+
+  /// \returns classifyFlavor() of \p SU, cached for SUnits in the region.
+  AMDGPU::InstructionFlavor getFlavor(const SUnit *SU) const {
+    if (SU->NodeNum < SUFlavors.size())
+      return SUFlavors[SU->NodeNum];
+    return AMDGPU::classifyFlavor(*SU->getInstr(), *SII);
+  }
 
   /// Given a \p Flavor , find the corresponding HardwareUnit. \returns the
   /// mapped HardwareUnit.
